@@ -1,0 +1,25 @@
+build/
+.gradle/
+local.properties
+*.iml
+.idea/
+app/libs/*.aar
+app/src/main/jniLibs/
+hev/
+*.jks
+*.keystore
+release.env
+signing.properties
+
+# Secrets and signing keys
+local.properties
+.env
+.env.*
+*.jks
+*.keystore
+secrets.properties
+
+# Build outputs
+**/build/
+*.apk
+*.aab

@@ -1,0 +1,70 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      V2SHIZZI_KEYSTORE_BASE64: ${{ secrets.V2SHIZZI_KEYSTORE_BASE64 }}
+      V2SHIZZI_KEYSTORE_PASSWORD: ${{ secrets.V2SHIZZI_KEYSTORE_PASSWORD }}
+      V2SHIZZI_KEY_ALIAS: ${{ secrets.V2SHIZZI_KEY_ALIAS }}
+      V2SHIZZI_KEY_PASSWORD: ${{ secrets.V2SHIZZI_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install SDK / NDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125"
+
+      - name: Download Xray core (libv2ray)
+        run: |
+          mkdir -p app/libs
+          curl -fL -o app/libs/libv2ray.aar \
+            https://github.com/2dust/AndroidLibXrayLite/releases/download/v26.7.28/libv2ray.aar
+          echo "cd4f58fde25dd4785d291bf9d368f88881f2abb0a02e199045a1b972bc40faad  app/libs/libv2ray.aar" | sha256sum -c -
+
+      - name: Build hev-socks5-tunnel (TUN to SOCKS)
+        run: |
+          git init hev
+          git -C hev remote add origin https://github.com/heiher/hev-socks5-tunnel.git
+          git -C hev fetch --depth 1 origin 21bb3d77e64ad5a413d4d851b9f4cacf2098cd77
+          git -C hev checkout --detach FETCH_HEAD
+          git -C hev submodule update --init --recursive --depth 1
+          export NDK=$ANDROID_HOME/ndk/26.1.10909125
+          cd hev
+          $NDK/ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=Android.mk \
+            "APP_ABI=arm64-v8a armeabi-v7a x86_64" APP_PLATFORM=android-29 \
+            NDK_LIBS_OUT=$GITHUB_WORKSPACE/app/src/main/jniLibs NDK_OUT=/tmp/ndkout
+          ls -R $GITHUB_WORKSPACE/app/src/main/jniLibs
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.7
+
+      - name: Build privately signed release
+        if: ${{ env.V2SHIZZI_KEYSTORE_BASE64 != '' }}
+        run: |
+          echo "$V2SHIZZI_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/v2shizzi-release.jks"
+          export V2SHIZZI_KEYSTORE="$RUNNER_TEMP/v2shizzi-release.jks"
+          gradle assembleRelease --no-daemon
+
+      - name: Build debug APK for testing (no release key configured)
+        if: ${{ env.V2SHIZZI_KEYSTORE_BASE64 == '' }}
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: V2Shizzi-VPN-APK
+          path: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/debug/*.apk

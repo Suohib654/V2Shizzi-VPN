@@ -1,0 +1,121 @@
+name: Build and publish V2Shizzi VPN to Cloudflare R2
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      V2SHIZZI_KEYSTORE_BASE64: ${{ secrets.V2SHIZZI_KEYSTORE_BASE64 }}
+      V2SHIZZI_KEYSTORE_PASSWORD: ${{ secrets.V2SHIZZI_KEYSTORE_PASSWORD }}
+      V2SHIZZI_KEY_ALIAS: ${{ secrets.V2SHIZZI_KEY_ALIAS }}
+      V2SHIZZI_KEY_PASSWORD: ${{ secrets.V2SHIZZI_KEY_PASSWORD }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_BUCKET: v2shizzi-updates
+      R2_PUBLIC_BASE_URL: https://updates.mrsuohib.online
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - name: Validate signing and R2 secrets
+        run: |
+          set -euo pipefail
+          test -n "$V2SHIZZI_KEYSTORE_BASE64"
+          test -n "$V2SHIZZI_KEYSTORE_PASSWORD"
+          test -n "$V2SHIZZI_KEY_ALIAS"
+          test -n "$V2SHIZZI_KEY_PASSWORD"
+          test -n "$AWS_ACCESS_KEY_ID"
+          test -n "$AWS_SECRET_ACCESS_KEY"
+          test -n "$R2_ACCOUNT_ID"
+      - name: Install SDK / NDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125"
+      - name: Download pinned Xray core
+        run: |
+          mkdir -p app/libs
+          curl -fL -o app/libs/libv2ray.aar https://github.com/2dust/AndroidLibXrayLite/releases/download/v26.7.28/libv2ray.aar
+          echo "cd4f58fde25dd4785d291bf9d368f88881f2abb0a02e199045a1b972bc40faad  app/libs/libv2ray.aar" | sha256sum -c -
+      - name: Build pinned hev tunnel library
+        run: |
+          git init hev
+          git -C hev remote add origin https://github.com/heiher/hev-socks5-tunnel.git
+          git -C hev fetch --depth 1 origin 21bb3d77e64ad5a413d4d851b9f4cacf2098cd77
+          git -C hev checkout --detach FETCH_HEAD
+          git -C hev submodule update --init --recursive --depth 1
+          export NDK="$ANDROID_HOME/ndk/26.1.10909125"
+          cd hev
+          "$NDK/ndk-build" NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=Android.mk \
+            "APP_ABI=arm64-v8a armeabi-v7a x86_64" APP_PLATFORM=android-29 \
+            NDK_LIBS_OUT="$GITHUB_WORKSPACE/app/src/main/jniLibs" NDK_OUT=/tmp/ndkout
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.7
+      - name: Build signed release APKs
+        run: |
+          set -euo pipefail
+          echo "$V2SHIZZI_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/v2shizzi-release.jks"
+          export V2SHIZZI_KEYSTORE="$RUNNER_TEMP/v2shizzi-release.jks"
+          gradle assembleRelease --no-daemon
+      - name: Prepare APKs and R2 manifest
+        run: |
+          set -euo pipefail
+          VERSION_NAME=$(sed -n 's/.*versionName = "\([^\"]*\)".*/\1/p' app/build.gradle.kts | head -1)
+          VERSION_CODE=$(sed -n 's/.*versionCode = \([0-9]*\).*/\1/p' app/build.gradle.kts | head -1)
+          test -n "$VERSION_NAME" && test -n "$VERSION_CODE"
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then test "$GITHUB_REF_NAME" = "v$VERSION_NAME"; fi
+          mkdir -p dist
+          cp app/build/outputs/apk/release/app-arm64-v8a-release.apk "dist/V2Shizzi-VPN-$VERSION_NAME-ARM64.apk"
+          cp app/build/outputs/apk/release/app-armeabi-v7a-release.apk "dist/V2Shizzi-VPN-$VERSION_NAME-ARMv7.apk"
+          cp app/build/outputs/apk/release/app-x86_64-release.apk "dist/V2Shizzi-VPN-$VERSION_NAME-x86_64.apk"
+          cp app/build/outputs/apk/release/app-universal-release.apk "dist/V2Shizzi-VPN-$VERSION_NAME-Universal.apk"
+          python3 - "$VERSION_CODE" "$VERSION_NAME" <<'PYGEN'
+          import hashlib, json, pathlib, sys, os
+          code, version = int(sys.argv[1]), sys.argv[2]
+          mapping = {
+              "arm64-v8a": f"V2Shizzi-VPN-{version}-ARM64.apk",
+              "armeabi-v7a": f"V2Shizzi-VPN-{version}-ARMv7.apk",
+              "x86_64": f"V2Shizzi-VPN-{version}-x86_64.apk",
+              "universal": f"V2Shizzi-VPN-{version}-Universal.apk",
+          }
+          root = pathlib.Path("dist")
+          assets = {}
+          for abi, name in mapping.items():
+              data = (root / name).read_bytes()
+              assets[abi] = {"url": f"{os.environ['R2_PUBLIC_BASE_URL']}/{name}", "sha256": hashlib.sha256(data).hexdigest()}
+          notes_path = pathlib.Path("RELEASE_NOTES.md")
+          notes = notes_path.read_text(encoding="utf-8").strip() if notes_path.exists() else f"إصدار V2Shizzi VPN {version}"
+          (root / "update.json").write_text(json.dumps({"versionCode": code, "versionName": version, "notes": notes, "assets": assets}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          (root / "SHA256SUMS.txt").write_text("".join(f"{hashlib.sha256((root/name).read_bytes()).hexdigest()}  {name}\n" for name in mapping.values()), encoding="utf-8")
+          PYGEN
+          cat dist/update.json
+      - name: Install AWS CLI
+        run: |
+          python3 -m pip install --user awscli
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Upload APKs and checksums to Cloudflare R2
+        run: |
+          set -euo pipefail
+          ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          for file in dist/*.apk dist/SHA256SUMS.txt; do
+            aws s3 cp "$file" "s3://${R2_BUCKET}/$(basename "$file")" \
+              --endpoint-url "$ENDPOINT" --cache-control "public, max-age=31536000, immutable"
+          done
+      - name: Publish update.json last
+        run: |
+          aws s3 cp dist/update.json "s3://${R2_BUCKET}/update.json" \
+            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+            --content-type "application/json; charset=utf-8" \
+            --cache-control "public, max-age=60, must-revalidate"
