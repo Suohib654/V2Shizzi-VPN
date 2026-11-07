@@ -22,8 +22,6 @@ jobs:
       - uses: android-actions/setup-android@v4
         with:
           log-accepted-android-sdk-licenses: false
-        with:
-          log-accepted-android-sdk-licenses: false
 
       - name: Install SDK / NDK
         run: |
